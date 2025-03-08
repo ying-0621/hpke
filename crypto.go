@@ -6,17 +6,16 @@ import (
 	"crypto/cipher"
 	"crypto/elliptic"
 	"crypto/hmac"
-	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"io"
-	_ "math"
 	"math/big"
 
 	_ "crypto/sha256"
 	_ "crypto/sha512"
-	//？？？？？？？？？？？？？？
-	"github.com/cloudflare/circl/dh/x448"
+
+	"git.schwanenlied.me/yawning/x448.git"
+	"github.com/cloudflare/circl/dh/sidh"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 )
@@ -26,21 +25,19 @@ import (
 
 type dhScheme interface {
 	ID() KEMID
-	DeriveKeyPair(ikm []byte) (KEMPrivateKey, KEMPublicKey, error)
-	SerializePublicKey(pk KEMPublicKey) []byte
-	DeserializePublicKey(enc []byte) (KEMPublicKey, error)
+	GenerateKeyPair(rand io.Reader) (KEMPrivateKey, KEMPublicKey, error)
+	Marshal(pk KEMPublicKey) []byte
+	Unmarshal(enc []byte) (KEMPublicKey, error)
 	DH(priv KEMPrivateKey, pub KEMPublicKey) ([]byte, error)
 	PublicKeySize() int
-	PrivateKeySize() int
 
-	SerializePrivateKey(sk KEMPrivateKey) []byte
-	DeserializePrivateKey(enc []byte) (KEMPrivateKey, error)
-
-	internalKDF() KDFScheme
+	MarshalPrivate(sk KEMPrivateKey) []byte
+	UnmarshalPrivate(enc []byte) (KEMPrivateKey, error)
 }
 
 type dhkemScheme struct {
 	group dhScheme
+	KDF   KDFScheme
 	skE   KEMPrivateKey
 }
 
@@ -48,24 +45,24 @@ func (s dhkemScheme) ID() KEMID {
 	return s.group.ID()
 }
 
-func (s dhkemScheme) DeriveKeyPair(ikm []byte) (KEMPrivateKey, KEMPublicKey, error) {
-	return s.group.DeriveKeyPair(ikm)
+func (s dhkemScheme) GenerateKeyPair(rand io.Reader) (KEMPrivateKey, KEMPublicKey, error) {
+	return s.group.GenerateKeyPair(rand)
 }
 
-func (s dhkemScheme) SerializePublicKey(pk KEMPublicKey) []byte {
-	return s.group.SerializePublicKey(pk)
+func (s dhkemScheme) Marshal(pk KEMPublicKey) []byte {
+	return s.group.Marshal(pk)
 }
 
-func (s dhkemScheme) SerializePrivateKey(sk KEMPrivateKey) []byte {
-	return s.group.SerializePrivateKey(sk)
+func (s dhkemScheme) MarshalPrivate(sk KEMPrivateKey) []byte {
+	return s.group.MarshalPrivate(sk)
 }
 
-func (s dhkemScheme) DeserializePublicKey(enc []byte) (KEMPublicKey, error) {
-	return s.group.DeserializePublicKey(enc)
+func (s dhkemScheme) Unmarshal(enc []byte) (KEMPublicKey, error) {
+	return s.group.Unmarshal(enc)
 }
 
-func (s dhkemScheme) DeserializePrivateKey(enc []byte) (KEMPrivateKey, error) {
-	return s.group.DeserializePrivateKey(enc)
+func (s dhkemScheme) UnmarshalPrivate(enc []byte) (KEMPrivateKey, error) {
+	return s.group.UnmarshalPrivate(enc)
 }
 
 func (s *dhkemScheme) setEphemeralKeyPair(skE KEMPrivateKey) {
@@ -77,16 +74,12 @@ func (s dhkemScheme) getEphemeralKeyPair(rand io.Reader) (KEMPrivateKey, KEMPubl
 		return s.skE, s.skE.PublicKey(), nil
 	}
 
-	ikm := make([]byte, s.PrivateKeySize())
-	rand.Read(ikm)
-
-	return s.group.DeriveKeyPair(ikm)
+	return s.group.GenerateKeyPair(rand)
 }
 
-func (s dhkemScheme) extractAndExpand(dh []byte, kemContext []byte, Nsecret int) []byte {
-	suiteID := kemSuiteFromID(s.ID())
-	eae_prk := s.group.internalKDF().LabeledExtract(nil, suiteID, "eae_prk", dh)
-	return s.group.internalKDF().LabeledExpand(eae_prk, suiteID, "shared_secret", kemContext, Nsecret)
+func (s dhkemScheme) extractAndExpand(dh []byte, kemContext []byte, Nzz int) []byte {
+	prk := s.KDF.LabeledExtract(nil, "dh", dh)
+	return s.KDF.LabeledExpand(prk, "prk", kemContext, Nzz)
 }
 
 func (s dhkemScheme) Encap(rand io.Reader, pkR KEMPublicKey) ([]byte, []byte, error) {
@@ -100,21 +93,21 @@ func (s dhkemScheme) Encap(rand io.Reader, pkR KEMPublicKey) ([]byte, []byte, er
 		return nil, nil, err
 	}
 
-	enc := s.group.SerializePublicKey(pkE)
-	pkRm := s.group.SerializePublicKey(pkR)
+	enc := s.group.Marshal(pkE)
+	pkRm := s.group.Marshal(pkR)
 
 	kemContext := make([]byte, len(enc)+len(pkRm))
 	copy(kemContext, enc)
 	copy(kemContext[len(enc):], pkRm)
 
-	Nsecret := s.group.internalKDF().OutputSize()
-	sharedSecret := s.extractAndExpand(dh, kemContext, Nsecret)
+	Nzz := s.KDF.OutputSize()
+	zz := s.extractAndExpand(dh, kemContext, Nzz)
 
-	return sharedSecret, enc, nil
+	return zz, enc, nil
 }
 
 func (s dhkemScheme) Decap(enc []byte, skR KEMPrivateKey) ([]byte, error) {
-	pkE, err := s.group.DeserializePublicKey(enc)
+	pkE, err := s.group.Unmarshal(enc)
 	if err != nil {
 		return nil, err
 	}
@@ -124,16 +117,16 @@ func (s dhkemScheme) Decap(enc []byte, skR KEMPrivateKey) ([]byte, error) {
 		return nil, err
 	}
 
-	pkRm := s.group.SerializePublicKey(skR.PublicKey())
+	pkRm := s.group.Marshal(skR.PublicKey())
 
 	kemContext := make([]byte, len(enc)+len(pkRm))
 	copy(kemContext, enc)
 	copy(kemContext[len(enc):], pkRm)
 
-	Nsecret := s.group.internalKDF().OutputSize()
-	sharedSecret := s.extractAndExpand(dh, kemContext, Nsecret)
+	Nzz := s.KDF.OutputSize()
+	zz := s.extractAndExpand(dh, kemContext, Nzz)
 
-	return sharedSecret, nil
+	return zz, nil
 }
 
 func (s dhkemScheme) AuthEncap(rand io.Reader, pkR KEMPublicKey, skS KEMPrivateKey) ([]byte, []byte, error) {
@@ -154,9 +147,9 @@ func (s dhkemScheme) AuthEncap(rand io.Reader, pkR KEMPublicKey, skS KEMPrivateK
 
 	dh := append(dhER, dhIR...)
 
-	enc := s.group.SerializePublicKey(pkE)
-	pkRm := s.group.SerializePublicKey(pkR)
-	pkSm := s.group.SerializePublicKey(skS.PublicKey())
+	enc := s.group.Marshal(pkE)
+	pkRm := s.group.Marshal(pkR)
+	pkSm := s.group.Marshal(skS.PublicKey())
 
 	Nenc := len(enc)
 	Npk := len(pkRm)
@@ -166,14 +159,14 @@ func (s dhkemScheme) AuthEncap(rand io.Reader, pkR KEMPublicKey, skS KEMPrivateK
 	copy(kemContext[Nenc:Nenc+Npk], pkRm)
 	copy(kemContext[Nenc+Npk:], pkSm)
 
-	Nsecret := s.group.internalKDF().OutputSize()
-	sharedSecret := s.extractAndExpand(dh, kemContext, Nsecret)
+	Nzz := s.KDF.OutputSize()
+	zz := s.extractAndExpand(dh, kemContext, Nzz)
 
-	return sharedSecret, enc, nil
+	return zz, enc, nil
 }
 
 func (s dhkemScheme) AuthDecap(enc []byte, skR KEMPrivateKey, pkS KEMPublicKey) ([]byte, error) {
-	pkE, err := s.group.DeserializePublicKey(enc)
+	pkE, err := s.group.Unmarshal(enc)
 	if err != nil {
 		return nil, err
 	}
@@ -190,8 +183,8 @@ func (s dhkemScheme) AuthDecap(enc []byte, skR KEMPrivateKey, pkS KEMPublicKey) 
 
 	dh := append(dhER, dhIR...)
 
-	pkRm := s.group.SerializePublicKey(skR.PublicKey())
-	pkSm := s.group.SerializePublicKey(pkS)
+	pkRm := s.group.Marshal(skR.PublicKey())
+	pkSm := s.group.Marshal(pkS)
 
 	Nenc := len(enc)
 	Npk := len(pkRm)
@@ -201,18 +194,14 @@ func (s dhkemScheme) AuthDecap(enc []byte, skR KEMPrivateKey, pkS KEMPublicKey) 
 	copy(kemContext[Nenc:Nenc+Npk], pkRm)
 	copy(kemContext[Nenc+Npk:], pkSm)
 
-	Nsecret := s.group.internalKDF().OutputSize()
-	sharedSecret := s.extractAndExpand(dh, kemContext, Nsecret)
+	Nzz := s.KDF.OutputSize()
+	zz := s.extractAndExpand(dh, kemContext, Nzz)
 
-	return sharedSecret, nil
+	return zz, nil
 }
 
 func (s dhkemScheme) PublicKeySize() int {
 	return s.group.PublicKeySize()
-}
-
-func (s dhkemScheme) PrivateKeySize() int {
-	return s.group.PrivateKeySize()
 }
 
 ////////////////////////
@@ -235,12 +224,7 @@ type ecdhPublicKey struct {
 
 type ecdhScheme struct {
 	curve elliptic.Curve
-	KDF   KDFScheme
 	skE   KEMPrivateKey
-}
-
-func (s ecdhScheme) internalKDF() KDFScheme {
-	return s.KDF
 }
 
 func (s ecdhScheme) ID() KEMID {
@@ -253,40 +237,17 @@ func (s ecdhScheme) ID() KEMID {
 	panic(fmt.Sprintf("Unsupported curve: %s", s.curve.Params().Name))
 }
 
-func (s ecdhScheme) privateKeyBitmask() uint8 {
-	switch s.curve.Params().Name {
-	case "P-256":
-		return 0xFF
-	case "P-521":
-		return 0x01
-	}
-	panic(fmt.Sprintf("Unsupported curve: %s", s.curve.Params().Name))
-}
-
-func (s ecdhScheme) DeriveKeyPair(ikm []byte) (KEMPrivateKey, KEMPublicKey, error) {
-	suiteID := kemSuiteFromID(s.ID())
-	dkp_prk := s.KDF.LabeledExtract(nil, suiteID, "dkp_prk", ikm)
-	counter := 0
-	for {
-		if counter > 255 {
-			return nil, nil, fmt.Errorf("Error deriving key pair")
-		}
-
-		bytes := s.KDF.LabeledExpand(dkp_prk, suiteID, "candidate", []byte{uint8(counter)}, s.PrivateKeySize())
-		bytes[0] = bytes[0] & s.privateKeyBitmask()
-
-		sk, err := s.DeserializePrivateKey(bytes)
-		if err == nil {
-			return sk, sk.PublicKey(), nil
-		}
-
-		counter = counter + 1
+func (s ecdhScheme) GenerateKeyPair(rand io.Reader) (KEMPrivateKey, KEMPublicKey, error) {
+	d, x, y, err := elliptic.GenerateKey(s.curve, rand)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	return nil, nil, fmt.Errorf("Error deriving key pair")
+	priv := &ecdhPrivateKey{s.curve, d, x, y}
+	return priv, priv.PublicKey(), nil
 }
 
-func (s ecdhScheme) SerializePublicKey(pk KEMPublicKey) []byte {
+func (s ecdhScheme) Marshal(pk KEMPublicKey) []byte {
 	if pk == nil {
 		return nil
 	}
@@ -294,7 +255,7 @@ func (s ecdhScheme) SerializePublicKey(pk KEMPublicKey) []byte {
 	return elliptic.Marshal(raw.curve, raw.x, raw.y)
 }
 
-func (s ecdhScheme) SerializePrivateKey(sk KEMPrivateKey) []byte {
+func (s ecdhScheme) MarshalPrivate(sk KEMPrivateKey) []byte {
 	if sk == nil {
 		return nil
 	}
@@ -305,16 +266,16 @@ func (s ecdhScheme) SerializePrivateKey(sk KEMPrivateKey) []byte {
 	return copied
 }
 
-func (s ecdhScheme) DeserializePublicKey(enc []byte) (KEMPublicKey, error) {
+func (s ecdhScheme) Unmarshal(enc []byte) (KEMPublicKey, error) {
 	x, y := elliptic.Unmarshal(s.curve, enc)
 	if x == nil {
-		return nil, fmt.Errorf("Error deserializing public key")
+		return nil, fmt.Errorf("Error unmarshaling public key")
 	}
 
 	return &ecdhPublicKey{s.curve, x, y}, nil
 }
 
-func (s ecdhScheme) DeserializePrivateKey(enc []byte) (KEMPrivateKey, error) {
+func (s ecdhScheme) UnmarshalPrivate(enc []byte) (KEMPrivateKey, error) {
 	if enc == nil {
 		return nil, fmt.Errorf("Invalid input")
 	}
@@ -334,12 +295,8 @@ func (s ecdhScheme) DH(priv KEMPrivateKey, pub KEMPublicKey) ([]byte, error) {
 		return nil, fmt.Errorf("Public key not suitable for ECDH")
 	}
 
-	x, _ := s.curve.Params().ScalarMult(ecdhPub.x, ecdhPub.y, ecdhPriv.d)
-	xx := x.Bytes()
-
-	size := (s.curve.Params().BitSize + 7) >> 3
-	pad := make([]byte, size-len(xx))
-	dh := append(pad, xx...)
+	x, y := s.curve.Params().ScalarMult(ecdhPub.x, ecdhPub.y, ecdhPriv.d)
+	dh := elliptic.Marshal(ecdhPub.curve, x, y)
 
 	return dh, nil
 }
@@ -347,10 +304,6 @@ func (s ecdhScheme) DH(priv KEMPrivateKey, pub KEMPublicKey) ([]byte, error) {
 func (s ecdhScheme) PublicKeySize() int {
 	feSize := (s.curve.Params().BitSize + 7) >> 3
 	return 1 + 2*feSize
-}
-
-func (s ecdhScheme) PrivateKeySize() int {
-	return (s.curve.Params().BitSize + 7) >> 3
 }
 
 ///////////////////
@@ -374,27 +327,21 @@ type x25519Scheme struct {
 	skE KEMPrivateKey
 }
 
-func (s x25519Scheme) internalKDF() KDFScheme {
-	return hkdfScheme{hash: crypto.SHA256}
-}
-
 func (s x25519Scheme) ID() KEMID {
 	return DHKEM_X25519
 }
 
-func (s x25519Scheme) DeriveKeyPair(ikm []byte) (KEMPrivateKey, KEMPublicKey, error) {
-	suiteID := kemSuiteFromID(s.ID())
-	dkp_prk := s.internalKDF().LabeledExtract(nil, suiteID, "dkp_prk", ikm)
-	sk_bytes := s.internalKDF().LabeledExpand(dkp_prk, suiteID, "sk", nil, s.PrivateKeySize())
-	sk, err := s.DeserializePrivateKey(sk_bytes)
+func (s x25519Scheme) GenerateKeyPair(rand io.Reader) (KEMPrivateKey, KEMPublicKey, error) {
+	priv := &x25519PrivateKey{}
+	_, err := rand.Read(priv.val[:])
 	if err != nil {
 		return nil, nil, err
-	} else {
-		return sk, sk.PublicKey(), nil
 	}
+
+	return priv, priv.PublicKey(), nil
 }
 
-func (s x25519Scheme) SerializePublicKey(pk KEMPublicKey) []byte {
+func (s x25519Scheme) Marshal(pk KEMPublicKey) []byte {
 	if pk == nil {
 		return nil
 	}
@@ -402,7 +349,7 @@ func (s x25519Scheme) SerializePublicKey(pk KEMPublicKey) []byte {
 	return raw.val[:]
 }
 
-func (s x25519Scheme) SerializePrivateKey(sk KEMPrivateKey) []byte {
+func (s x25519Scheme) MarshalPrivate(sk KEMPrivateKey) []byte {
 	if sk == nil {
 		return nil
 	}
@@ -410,9 +357,9 @@ func (s x25519Scheme) SerializePrivateKey(sk KEMPrivateKey) []byte {
 	return raw.val[:]
 }
 
-func (s x25519Scheme) DeserializePublicKey(enc []byte) (KEMPublicKey, error) {
+func (s x25519Scheme) Unmarshal(enc []byte) (KEMPublicKey, error) {
 	if len(enc) != 32 {
-		return nil, fmt.Errorf("Error deserializing X25519 public key")
+		return nil, fmt.Errorf("Error unmarshaling X25519 public key")
 	}
 
 	pub := &x25519PublicKey{}
@@ -420,13 +367,13 @@ func (s x25519Scheme) DeserializePublicKey(enc []byte) (KEMPublicKey, error) {
 	return pub, nil
 }
 
-func (s x25519Scheme) DeserializePrivateKey(enc []byte) (KEMPrivateKey, error) {
+func (s x25519Scheme) UnmarshalPrivate(enc []byte) (KEMPrivateKey, error) {
 	if enc == nil {
 		return nil, fmt.Errorf("Invalid input")
 	}
 
 	if len(enc) != 32 {
-		return nil, fmt.Errorf("Error deserializing X25519 private key")
+		return nil, fmt.Errorf("Error unmarshaling X25519 private key")
 	}
 
 	key := &x25519PrivateKey{}
@@ -445,15 +392,13 @@ func (s x25519Scheme) DH(priv KEMPrivateKey, pub KEMPublicKey) ([]byte, error) {
 		return nil, fmt.Errorf("Private key not suitable for X25519")
 	}
 
-	sharedSecret, err := curve25519.X25519(xPriv.val[:], xPub.val[:])
-	return sharedSecret, err
+	// TODO ScalarMult
+	var zz [32]byte
+	curve25519.ScalarMult(&zz, &xPriv.val, &xPub.val)
+	return zz[:], nil
 }
 
 func (s x25519Scheme) PublicKeySize() int {
-	return 32
-}
-
-func (s x25519Scheme) PrivateKeySize() int {
 	return 32
 }
 
@@ -461,44 +406,38 @@ func (s x25519Scheme) PrivateKeySize() int {
 // ECDH with X448
 
 type x448PrivateKey struct {
-	val x448.Key
+	val [56]byte
 }
 
 func (priv x448PrivateKey) PublicKey() KEMPublicKey {
 	pub := &x448PublicKey{}
-	x448.KeyGen(&pub.val, &priv.val)
+	x448.ScalarBaseMult(&pub.val, &priv.val)
 	return pub
 }
 
 type x448PublicKey struct {
-	val x448.Key
+	val [56]byte
 }
 
 type x448Scheme struct {
 	skE KEMPrivateKey
 }
 
-func (s x448Scheme) internalKDF() KDFScheme {
-	return hkdfScheme{hash: crypto.SHA512}
-}
-
 func (s x448Scheme) ID() KEMID {
 	return DHKEM_X448
 }
 
-func (s x448Scheme) DeriveKeyPair(ikm []byte) (KEMPrivateKey, KEMPublicKey, error) {
-	suiteID := kemSuiteFromID(s.ID())
-	dkp_prk := s.internalKDF().LabeledExtract(nil, suiteID, "dkp_prk", ikm)
-	sk_bytes := s.internalKDF().LabeledExpand(dkp_prk, suiteID, "sk", nil, s.PrivateKeySize())
-	sk, err := s.DeserializePrivateKey(sk_bytes)
+func (s x448Scheme) GenerateKeyPair(rand io.Reader) (KEMPrivateKey, KEMPublicKey, error) {
+	priv := &x448PrivateKey{}
+	_, err := rand.Read(priv.val[:])
 	if err != nil {
 		return nil, nil, err
-	} else {
-		return sk, sk.PublicKey(), nil
 	}
+
+	return priv, priv.PublicKey(), nil
 }
 
-func (s x448Scheme) SerializePublicKey(pk KEMPublicKey) []byte {
+func (s x448Scheme) Marshal(pk KEMPublicKey) []byte {
 	if pk == nil {
 		return nil
 	}
@@ -506,7 +445,7 @@ func (s x448Scheme) SerializePublicKey(pk KEMPublicKey) []byte {
 	return raw.val[:]
 }
 
-func (s x448Scheme) SerializePrivateKey(sk KEMPrivateKey) []byte {
+func (s x448Scheme) MarshalPrivate(sk KEMPrivateKey) []byte {
 	if sk == nil {
 		return nil
 	}
@@ -514,9 +453,9 @@ func (s x448Scheme) SerializePrivateKey(sk KEMPrivateKey) []byte {
 	return raw.val[:]
 }
 
-func (s x448Scheme) DeserializePublicKey(enc []byte) (KEMPublicKey, error) {
+func (s x448Scheme) Unmarshal(enc []byte) (KEMPublicKey, error) {
 	if len(enc) != 56 {
-		return nil, fmt.Errorf("Error deserializing X448 public key")
+		return nil, fmt.Errorf("Error unmarshaling X448 public key")
 	}
 
 	pub := &x448PublicKey{}
@@ -524,13 +463,13 @@ func (s x448Scheme) DeserializePublicKey(enc []byte) (KEMPublicKey, error) {
 	return pub, nil
 }
 
-func (s x448Scheme) DeserializePrivateKey(enc []byte) (KEMPrivateKey, error) {
+func (s x448Scheme) UnmarshalPrivate(enc []byte) (KEMPrivateKey, error) {
 	if enc == nil {
 		return nil, fmt.Errorf("Invalid input")
 	}
 
 	if len(enc) != 56 {
-		return nil, fmt.Errorf("Error deserializing X448 private key")
+		return nil, fmt.Errorf("Error unmarshaling X448 private key")
 	}
 
 	key := &x448PrivateKey{}
@@ -549,21 +488,154 @@ func (s x448Scheme) DH(priv KEMPrivateKey, pub KEMPublicKey) ([]byte, error) {
 		return nil, fmt.Errorf("Public key not suitable for X448: %+v", pub)
 	}
 
-	var sharedSecret, zero x448.Key
-	x448.Shared(&sharedSecret, &xPriv.val, &xPub.val)
-	if subtle.ConstantTimeCompare(sharedSecret[:], zero[:]) == 1 {
-		return nil, fmt.Errorf("bad input point: low order point")
-	}
-
-	return sharedSecret[:], nil
+	var zz [56]byte
+	x448.ScalarMult(&zz, &xPriv.val, &xPub.val)
+	return zz[:], nil
 }
 
 func (s x448Scheme) PublicKeySize() int {
 	return 56
 }
 
-func (s x448Scheme) PrivateKeySize() int {
-	return 56
+///////
+// SIKE
+
+type sikePublicKey struct {
+	field uint8
+	pub   *sidh.PublicKey
+}
+
+type sikePrivateKey struct {
+	field uint8
+	priv  *sidh.PrivateKey
+	pub   *sidh.PublicKey
+}
+
+func (priv sikePrivateKey) PublicKey() KEMPublicKey {
+	return &sikePublicKey{priv.field, priv.pub}
+}
+
+type sikeScheme struct {
+	field uint8
+	KDF   KDFScheme
+}
+
+func (s sikeScheme) ID() KEMID {
+	switch s.field {
+	case sidh.Fp503:
+		return KEM_SIKE503
+	case sidh.Fp751:
+		return KEM_SIKE751
+	}
+	panic(fmt.Sprintf("Unsupported field: %d", s.field))
+}
+
+func (s sikeScheme) GenerateKeyPair(rand io.Reader) (KEMPrivateKey, KEMPublicKey, error) {
+	rawPriv := sidh.NewPrivateKey(s.field, sidh.KeyVariantSike)
+	err := rawPriv.Generate(rand)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rawPub := sidh.NewPublicKey(s.field, sidh.KeyVariantSike)
+	rawPriv.GeneratePublicKey(rawPub)
+
+	priv := &sikePrivateKey{s.field, rawPriv, rawPub}
+	return priv, priv.PublicKey(), nil
+}
+
+func (s sikeScheme) Marshal(pk KEMPublicKey) []byte {
+	if pk == nil {
+		return nil
+	}
+	raw := pk.(*sikePublicKey)
+	out := make([]byte, raw.pub.Size())
+	raw.pub.Export(out)
+	return out
+}
+
+func (s sikeScheme) MarshalPrivate(sk KEMPrivateKey) []byte {
+	panic("Not implemented")
+	return nil
+}
+
+func (s sikeScheme) Unmarshal(enc []byte) (KEMPublicKey, error) {
+	rawPub := sidh.NewPublicKey(s.field, sidh.KeyVariantSike)
+	if len(enc) != rawPub.Size() {
+		return nil, fmt.Errorf("Invalid public key size: got %d, expected %d", len(enc), rawPub.Size())
+	}
+
+	err := rawPub.Import(enc)
+	if err != nil {
+		return nil, err
+	}
+
+	return &sikePublicKey{s.field, rawPub}, nil
+}
+
+func (s sikeScheme) UnmarshalPrivate(enc []byte) (KEMPrivateKey, error) {
+	panic("Not implemented")
+	return nil, nil
+}
+
+func (s sikeScheme) newKEM(rand io.Reader) (*sidh.KEM, error) {
+	switch s.field {
+	case sidh.Fp503:
+		return sidh.NewSike503(rand), nil
+	case sidh.Fp751:
+		return sidh.NewSike751(rand), nil
+	}
+	return nil, fmt.Errorf("Invalid field")
+}
+
+func (s sikeScheme) Encap(rand io.Reader, pkR KEMPublicKey) ([]byte, []byte, error) {
+	raw := pkR.(*sikePublicKey)
+
+	kem, err := s.newKEM(rand)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	enc := make([]byte, kem.CiphertextSize())
+	zz := make([]byte, s.KDF.OutputSize())
+	err = kem.Encapsulate(enc, zz, raw.pub)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return zz, enc, nil
+}
+
+type panicReader struct{}
+
+func (p panicReader) Read(unused []byte) (int, error) {
+	panic("Should not read")
+}
+
+func (s sikeScheme) Decap(enc []byte, skR KEMPrivateKey) ([]byte, error) {
+	raw := skR.(*sikePrivateKey)
+
+	kem, err := s.newKEM(panicReader{})
+	if err != nil {
+		return nil, err
+	}
+
+	zz := make([]byte, s.KDF.OutputSize())
+	err = kem.Decapsulate(zz, raw.priv, raw.pub, enc)
+	if err != nil {
+		return nil, err
+	}
+
+	return zz, nil
+}
+
+func (s sikeScheme) PublicKeySize() int {
+	rawPub := sidh.NewPublicKey(s.field, sidh.KeyVariantSike)
+	return rawPub.Size()
+}
+
+func (s sikeScheme) setEphemeralKeyPair(skE KEMPrivateKey) {
+	panic("SIKE cannot use a pre-set ephemeral key pair")
 }
 
 //////////
@@ -627,28 +699,6 @@ func (s chachaPolyScheme) NonceSize() int {
 	return chacha20poly1305.NonceSize
 }
 
-//////////
-// Export-only AEAD scheme
-
-type exportOnlyScheme struct {
-}
-
-func (s exportOnlyScheme) ID() AEADID {
-	return AEAD_EXPORT_ONLY
-}
-
-func (s exportOnlyScheme) New(key []byte) (cipher.AEAD, error) {
-	panic("Not supported")
-}
-
-func (s exportOnlyScheme) KeySize() int {
-	panic("Not supported")
-}
-
-func (s exportOnlyScheme) NonceSize() int {
-	panic("Not supported")
-}
-
 ///////
 // HKDF
 
@@ -705,25 +755,20 @@ func (s hkdfScheme) Expand(prk, info []byte, outLen int) []byte {
 	return out[:outLen]
 }
 
-func (s hkdfScheme) LabeledExtract(salt []byte, suiteID []byte, label string, ikm []byte) []byte {
-	labeledIKM := append([]byte(versionLabel), suiteID...)
-	labeledIKM = append(labeledIKM, []byte(label)...)
-	labeledIKM = append(labeledIKM, ikm...)
+func (s hkdfScheme) LabeledExtract(salt []byte, label string, ikm []byte) []byte {
+	labeledIKM := append([]byte(rfcLabel+" "+label), ikm...)
 	return s.Extract(salt, labeledIKM)
 }
 
-func (s hkdfScheme) LabeledExpand(prk []byte, suiteID []byte, label string, info []byte, L int) []byte {
+func (s hkdfScheme) LabeledExpand(prk []byte, label string, info []byte, L int) []byte {
 	if L > (1 << 16) {
 		panic("Expand length cannot be larger than 2^16")
 	}
 
 	lengthBuffer := make([]byte, 2)
 	binary.BigEndian.PutUint16(lengthBuffer, uint16(L))
-	labeledLength := append(lengthBuffer, []byte(versionLabel)...)
-	labeledInfo := append(labeledLength, suiteID...)
-	labeledInfo = append(labeledInfo, []byte(label)...)
-	labeledInfo = append(labeledInfo, info...)
-
+	labeledLength := append(lengthBuffer, []byte(rfcLabel+" "+label)...)
+	labeledInfo := append(labeledLength, info...)
 	return s.Expand(prk, labeledInfo, L)
 }
 
@@ -741,31 +786,33 @@ const (
 	DHKEM_P521   KEMID = 0x0012
 	DHKEM_X25519 KEMID = 0x0020
 	DHKEM_X448   KEMID = 0x0021
-
-	// The following identifiers were used for prototype SIKE integration.  Since
-	// SIKE has been broken, we have removed this prototype, but in case anyone is
-	// using these identifiers, we list them here as reserved.
-	reserved1 KEMID = 0xFFFE // Was KEM_SIKE503
-	reserved2 KEMID = 0xFFFF // Was KEM_SIKE751
+	KEM_SIKE503  KEMID = 0xFFFE
+	KEM_SIKE751  KEMID = 0xFFFF
 )
 
 var kems = map[KEMID]KEMScheme{
-	DHKEM_X25519: &dhkemScheme{group: x25519Scheme{}},
-	DHKEM_X448:   &dhkemScheme{group: x448Scheme{}},
-	DHKEM_P256:   &dhkemScheme{group: ecdhScheme{curve: elliptic.P256(), KDF: hkdfScheme{hash: crypto.SHA256}}},
-	DHKEM_P521:   &dhkemScheme{group: ecdhScheme{curve: elliptic.P521(), KDF: hkdfScheme{hash: crypto.SHA512}}},
+	DHKEM_X25519: &dhkemScheme{group: x25519Scheme{}, KDF: hkdfScheme{hash: crypto.SHA256}},
+	DHKEM_X448:   &dhkemScheme{group: x448Scheme{}, KDF: hkdfScheme{hash: crypto.SHA512}},
+	DHKEM_P256:   &dhkemScheme{group: ecdhScheme{curve: elliptic.P256()}, KDF: hkdfScheme{hash: crypto.SHA256}},
+	DHKEM_P521:   &dhkemScheme{group: ecdhScheme{curve: elliptic.P521()}, KDF: hkdfScheme{hash: crypto.SHA512}},
+	KEM_SIKE503:  &sikeScheme{field: sidh.Fp503, KDF: hkdfScheme{hash: crypto.SHA512}},
+	KEM_SIKE751:  &sikeScheme{field: sidh.Fp751, KDF: hkdfScheme{hash: crypto.SHA512}},
 }
 
 func newKEMScheme(kemID KEMID) (KEMScheme, bool) {
 	switch kemID {
 	case DHKEM_X25519:
-		return &dhkemScheme{group: x25519Scheme{}}, true
+		return &dhkemScheme{group: x25519Scheme{}, KDF: hkdfScheme{hash: crypto.SHA256}}, true
 	case DHKEM_X448:
-		return &dhkemScheme{group: x448Scheme{}}, true
+		return &dhkemScheme{group: x448Scheme{}, KDF: hkdfScheme{hash: crypto.SHA512}}, true
 	case DHKEM_P256:
-		return &dhkemScheme{group: ecdhScheme{curve: elliptic.P256(), KDF: hkdfScheme{hash: crypto.SHA256}}}, true
+		return &dhkemScheme{group: ecdhScheme{curve: elliptic.P256()}, KDF: hkdfScheme{hash: crypto.SHA256}}, true
 	case DHKEM_P521:
-		return &dhkemScheme{group: ecdhScheme{curve: elliptic.P521(), KDF: hkdfScheme{hash: crypto.SHA512}}}, true
+		return &dhkemScheme{group: ecdhScheme{curve: elliptic.P521()}, KDF: hkdfScheme{hash: crypto.SHA512}}, true
+	case KEM_SIKE503:
+		return &sikeScheme{field: sidh.Fp503, KDF: hkdfScheme{hash: crypto.SHA512}}, true
+	case KEM_SIKE751:
+		return &sikeScheme{field: sidh.Fp751, KDF: hkdfScheme{hash: crypto.SHA512}}, true
 	default:
 		return nil, false
 	}
@@ -797,14 +844,12 @@ const (
 	AEAD_AESGCM128        AEADID = 0x0001
 	AEAD_AESGCM256        AEADID = 0x0002
 	AEAD_CHACHA20POLY1305 AEADID = 0x0003
-	AEAD_EXPORT_ONLY      AEADID = 0xFFFF
 )
 
 var aeads = map[AEADID]AEADScheme{
 	AEAD_AESGCM128:        aesgcmScheme{keySize: 16},
 	AEAD_AESGCM256:        aesgcmScheme{keySize: 32},
 	AEAD_CHACHA20POLY1305: chachaPolyScheme{},
-	AEAD_EXPORT_ONLY:      exportOnlyScheme{},
 }
 
 func AssembleCipherSuite(kemID KEMID, kdfID KDFID, aeadID AEADID) (CipherSuite, error) {
@@ -828,13 +873,4 @@ func AssembleCipherSuite(kemID KEMID, kdfID KDFID, aeadID AEADID) (CipherSuite, 
 		KDF:  kdf,
 		AEAD: aead,
 	}, nil
-}
-
-//////////
-// Helpers
-
-func kemSuiteFromID(id KEMID) []byte {
-	idBuffer := make([]byte, 2)
-	binary.BigEndian.PutUint16(idBuffer, uint16(id))
-	return append([]byte("KEM"), idBuffer...)
 }

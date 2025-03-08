@@ -1,12 +1,13 @@
 package hpke
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/elliptic"
 	"crypto/rand"
 	"testing"
 
-	"github.com/stretchr/testify/require"
+	"github.com/cloudflare/circl/dh/sidh"
 )
 
 func randomBytes(size int) []byte {
@@ -17,61 +18,78 @@ func randomBytes(size int) []byte {
 
 func TestKEMSchemes(t *testing.T) {
 	schemes := []KEMScheme{
-		&dhkemScheme{group: x25519Scheme{}},
-		&dhkemScheme{group: x448Scheme{}},
-		&dhkemScheme{group: ecdhScheme{curve: elliptic.P256(), KDF: hkdfScheme{hash: crypto.SHA256}}},
-		&dhkemScheme{group: ecdhScheme{curve: elliptic.P521(), KDF: hkdfScheme{hash: crypto.SHA256}}},
+		&dhkemScheme{group: x25519Scheme{}, KDF: hkdfScheme{hash: crypto.SHA256}},
+		&dhkemScheme{group: x448Scheme{}, KDF: hkdfScheme{hash: crypto.SHA512}},
+		&dhkemScheme{group: ecdhScheme{curve: elliptic.P256()}, KDF: hkdfScheme{hash: crypto.SHA256}},
+		&dhkemScheme{group: ecdhScheme{curve: elliptic.P521()}, KDF: hkdfScheme{hash: crypto.SHA512}},
+		&sikeScheme{field: sidh.Fp503, KDF: hkdfScheme{hash: crypto.SHA512}},
+		&sikeScheme{field: sidh.Fp751, KDF: hkdfScheme{hash: crypto.SHA512}},
 	}
 
 	for i, s := range schemes {
-		ikm := make([]byte, s.PrivateKeySize())
-		rand.Reader.Read(ikm)
+		skR, pkR, err := s.GenerateKeyPair(rand.Reader)
+		if err != nil {
+			t.Fatalf("[%d] Error generating KEM key pair: %v", i, err)
+		}
 
-		skR, pkR, err := s.DeriveKeyPair(ikm)
-		require.Nil(t, err, "[%d] Error generating KEM key pair: %v", i, err)
+		zzI, enc, err := s.Encap(rand.Reader, pkR)
+		if err != nil {
+			t.Fatalf("[%d] Error in KEM encapsulation: %v", i, err)
+		}
 
-		sharedSecretI, enc, err := s.Encap(rand.Reader, pkR)
-		require.Nil(t, err, "[%d] Error in KEM encapsulation: %v", i, err)
+		zzR, err := s.Decap(enc, skR)
+		if err != nil {
+			t.Fatalf("[%d] Error in KEM decapsulation: %v", i, err)
+		}
 
-		sharedSecretR, err := s.Decap(enc, skR)
-		require.Nil(t, err, "[%d] Error in KEM decapsulation: %v", i, err)
-
-		require.Equal(t, sharedSecretI, sharedSecretR, "[%d] Asymmetric KEM results [%x] != [%x]", i, sharedSecretI, sharedSecretR)
+		if !bytes.Equal(zzI, zzR) {
+			t.Fatalf("[%d] Asymmetric KEM results [%x] != [%x]", i, zzI, zzR)
+		}
 	}
 }
 
 func TestDHSchemes(t *testing.T) {
 	schemes := []dhScheme{
-		ecdhScheme{curve: elliptic.P256(), KDF: hkdfScheme{hash: crypto.SHA256}},
-		ecdhScheme{curve: elliptic.P521(), KDF: hkdfScheme{hash: crypto.SHA512}},
+		ecdhScheme{curve: elliptic.P256()},
+		ecdhScheme{curve: elliptic.P521()},
 		x25519Scheme{},
 		x448Scheme{},
 	}
 
 	for i, s := range schemes {
-		ikm := make([]byte, s.PrivateKeySize())
-		rand.Reader.Read(ikm)
-		skA, pkA, err := s.DeriveKeyPair(ikm)
-		require.Nil(t, err, "[%d] Error generating DH key pair: %v", i, err)
+		skA, pkA, err := s.GenerateKeyPair(rand.Reader)
+		if err != nil {
+			t.Fatalf("[%d] Error generating DH key pair: %v", i, err)
+		}
 
-		rand.Reader.Read(ikm)
-		skB, pkB, err := s.DeriveKeyPair(ikm)
-		require.Nil(t, err, "[%d] Error generating DH key pair: %v", i, err)
+		skB, pkB, err := s.GenerateKeyPair(rand.Reader)
+		if err != nil {
+			t.Fatalf("[%d] Error generating DH key pair: %v", i, err)
+		}
 
-		enc := s.SerializePublicKey(pkA)
-		_, err = s.DeserializePublicKey(enc)
-		require.Nil(t, err, "[%d] Error parsing DH public key: %v", i, err)
+		enc := s.Marshal(pkA)
+		_, err = s.Unmarshal(enc)
+		if err != nil {
+			t.Fatalf("[%d] Error parsing DH public key: %v", i, err)
+		}
 
-		sharedSecretAB, err := s.DH(skA, pkB)
-		require.Nil(t, err, "[%d] Error performing DH operation: %v", i, err)
+		zzAB, err := s.DH(skA, pkB)
+		if err != nil {
+			t.Fatalf("[%d] Error performing DH operation: %v", i, err)
+		}
 
-		sharedSecretBA, err := s.DH(skB, pkA)
-		require.Nil(t, err, "[%d] Error performing DH operation: %v", i, err)
-		require.Equal(t, sharedSecretAB, sharedSecretBA, "[%d] Asymmetric DH results [%x] != [%x]", i, sharedSecretAB, sharedSecretBA)
+		zzBA, err := s.DH(skB, pkA)
+		if err != nil {
+			t.Fatalf("[%d] Error performing DH operation: %v", i, err)
+		}
 
-		pkAn := len(s.SerializePublicKey(pkA))
-		pkBn := len(s.SerializePublicKey(pkB))
-		require.Equal(t, pkAn, pkBn, "[%d] Non-constant public key size [%x] != [%x]", i, pkAn, pkBn)
+		if !bytes.Equal(zzAB, zzBA) {
+			t.Fatalf("[%d] Asymmetric DH results [%x] != [%x]", i, zzAB, zzBA)
+		}
+
+		if len(s.Marshal(pkA)) != len(s.Marshal(pkB)) {
+			t.Fatalf("[%d] Non-constant public key size [%x] != [%x]", i, len(s.Marshal(pkA)), len(s.Marshal(pkB)))
+		}
 	}
 }
 
@@ -89,34 +107,32 @@ func TestAEADSchemes(t *testing.T) {
 		aad := randomBytes(1024)
 
 		aead, err := s.New(key)
-		require.Nil(t, err, "[%d] Error instantiating AEAD: %v", i, err)
+		if err != nil {
+			t.Fatalf("[%d] Error instantiating AEAD: %v", i, err)
+		}
 
 		ctWithAAD := aead.Seal(nil, nonce, pt, aad)
 		ptWithAAD, err := aead.Open(nil, nonce, ctWithAAD, aad)
-		require.Nil(t, err, "[%d] Error decrypting with AAD: %v", i, err)
-		require.Equal(t, ptWithAAD, pt, "[%d] Incorrect decryption [%x] != [%x]", i, ptWithAAD, pt)
+		if err != nil {
+			t.Fatalf("[%d] Error decrypting with AAD: %v", i, err)
+		}
+
+		if !bytes.Equal(ptWithAAD, pt) {
+			t.Fatalf("[%d] Incorrect decryption [%x] != [%x]", i, ptWithAAD, pt)
+		}
 
 		ctWithoutAAD := aead.Seal(nil, nonce, pt, nil)
 		ptWithoutAAD, err := aead.Open(nil, nonce, ctWithoutAAD, nil)
-		require.Nil(t, err, "[%d] Error decrypting without AAD: %v", i, err)
-		require.Equal(t, ptWithoutAAD, pt, "[%d] Incorrect decryption [%x] != [%x]", i, ptWithoutAAD, pt)
+		if err != nil {
+			t.Fatalf("[%d] Error decrypting without AAD: %v", i, err)
+		}
 
-		require.NotEqual(t, ctWithAAD, ctWithoutAAD, "[%d] AAD not included in ciphertext", i)
+		if !bytes.Equal(ptWithoutAAD, pt) {
+			t.Fatalf("[%d] Incorrect decryption [%x] != [%x]", i, ptWithoutAAD, pt)
+		}
+
+		if bytes.Equal(ctWithAAD, ctWithoutAAD) {
+			t.Fatalf("[%d] AAD not included in ciphertext", i)
+		}
 	}
-}
-
-func TestExportOnlyAEADScheme(t *testing.T) {
-	scheme, ok := aeads[AEAD_EXPORT_ONLY]
-
-	require.True(t, ok, "Export-only AEAD lookup failed")
-	require.Equal(t, scheme.ID(), AEAD_EXPORT_ONLY, "Export-only AEAD ID mismatch")
-	require.Panics(t, func() {
-		_, _ = scheme.New([]byte{0x00})
-	}, "New() did not panic")
-	require.Panics(t, func() {
-		_ = scheme.KeySize()
-	}, "KeySize() did not panic")
-	require.Panics(t, func() {
-		_ = scheme.NonceSize()
-	}, "NonceSize() did not panic")
 }
