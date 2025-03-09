@@ -12,6 +12,7 @@ import (
 	"math/big"
 
 	_ "crypto/sha256"
+	_ "crypto/sha3"
 	_ "crypto/sha512"
 
 	"git.schwanenlied.me/yawning/x448.git"
@@ -625,7 +626,7 @@ func (s sikeScheme) Decap(enc []byte, skR KEMPrivateKey) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	//shared secret key
 	return zz, nil
 }
 
@@ -714,6 +715,8 @@ func (s hkdfScheme) ID() KDFID {
 		return KDF_HKDF_SHA384
 	case crypto.SHA512:
 		return KDF_HKDF_SHA512
+	case crypto.SHA3_256:
+		return KDF_HKDF_SHA3_256
 	}
 	panic(fmt.Sprintf("Unsupported hash: %d", s.hash))
 }
@@ -824,15 +827,17 @@ func newKEMScheme(kemID KEMID) (KEMScheme, bool) {
 type KDFID uint16
 
 const (
-	KDF_HKDF_SHA256 KDFID = 0x0001
-	KDF_HKDF_SHA384 KDFID = 0x0002
-	KDF_HKDF_SHA512 KDFID = 0x0003
+	KDF_HKDF_SHA256   KDFID = 0x0001
+	KDF_HKDF_SHA384   KDFID = 0x0002
+	KDF_HKDF_SHA512   KDFID = 0x0003
+	KDF_HKDF_SHA3_256 KDFID = 0x0004
 )
 
 var kdfs = map[KDFID]KDFScheme{
-	KDF_HKDF_SHA256: hkdfScheme{hash: crypto.SHA256},
-	KDF_HKDF_SHA384: hkdfScheme{hash: crypto.SHA384},
-	KDF_HKDF_SHA512: hkdfScheme{hash: crypto.SHA512},
+	KDF_HKDF_SHA256:   hkdfScheme{hash: crypto.SHA256},
+	KDF_HKDF_SHA384:   hkdfScheme{hash: crypto.SHA384},
+	KDF_HKDF_SHA512:   hkdfScheme{hash: crypto.SHA512},
+	KDF_HKDF_SHA3_256: hkdfScheme{hash: crypto.SHA3_256},
 }
 
 ///////////////////////////

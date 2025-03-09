@@ -5,6 +5,8 @@ import (
 	"crypto"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/hex"
+	"log"
 	"testing"
 
 	"github.com/cloudflare/circl/dh/sidh"
@@ -16,36 +18,58 @@ func randomBytes(size int) []byte {
 	return out
 }
 
+// P256_SHA3_256_AES_GCM_256(密钥交换算法：P256;哈希算法：SHA3-256;对称加密算法：AES-GCM-256)
 func TestKEMSchemes(t *testing.T) {
 	schemes := []KEMScheme{
 		&dhkemScheme{group: x25519Scheme{}, KDF: hkdfScheme{hash: crypto.SHA256}},
 		&dhkemScheme{group: x448Scheme{}, KDF: hkdfScheme{hash: crypto.SHA512}},
 		&dhkemScheme{group: ecdhScheme{curve: elliptic.P256()}, KDF: hkdfScheme{hash: crypto.SHA256}},
 		&dhkemScheme{group: ecdhScheme{curve: elliptic.P521()}, KDF: hkdfScheme{hash: crypto.SHA512}},
+		&dhkemScheme{group: ecdhScheme{curve: elliptic.P256()}, KDF: hkdfScheme{hash: crypto.SHA3_256}},
 		&sikeScheme{field: sidh.Fp503, KDF: hkdfScheme{hash: crypto.SHA512}},
 		&sikeScheme{field: sidh.Fp751, KDF: hkdfScheme{hash: crypto.SHA512}},
 	}
 
 	for i, s := range schemes {
+		log.Printf("Testing scheme %d", i)
+
+		// Generate key pair
+		log.Printf("Scheme %d: Generating KEM key pair", i)
 		skR, pkR, err := s.GenerateKeyPair(rand.Reader)
 		if err != nil {
-			t.Fatalf("[%d] Error generating KEM key pair: %v", i, err)
+			t.Fatalf("Scheme %d: Error generating KEM key pair: %v", i, err)
 		}
 
+		log.Printf("Scheme %d: KEM key pair generated successfully", i)
+
+		// 输出公钥和私钥
+		log.Printf("Scheme %d: Public Key: %s", i, hex.EncodeToString(s.Marshal(pkR)))
+		log.Printf("Scheme %d: Private Key: %s", i, hex.EncodeToString(s.MarshalPrivate(skR)))
+
+		// Encapsulation
+		log.Printf("Scheme %d: Performing KEM encapsulation", i)
 		zzI, enc, err := s.Encap(rand.Reader, pkR)
 		if err != nil {
-			t.Fatalf("[%d] Error in KEM encapsulation: %v", i, err)
+			t.Fatalf("Scheme %d: Error in KEM encapsulation: %v", i, err)
 		}
+		log.Printf("Scheme %d: KEM encapsulation completed successfully", i)
 
+		// Decapsulation
+		log.Printf("Scheme %d: Performing KEM decapsulation", i)
 		zzR, err := s.Decap(enc, skR)
 		if err != nil {
-			t.Fatalf("[%d] Error in KEM decapsulation: %v", i, err)
+			t.Fatalf("Scheme %d: Error in KEM decapsulation: %v", i, err)
 		}
-
+		log.Printf("Scheme %d: KEM decapsulation completed successfully", i)
+		// Verify results
+		log.Printf("Scheme %d: Verifying KEM results", i)
 		if !bytes.Equal(zzI, zzR) {
-			t.Fatalf("[%d] Asymmetric KEM results [%x] != [%x]", i, zzI, zzR)
+			t.Fatalf("Scheme %d: Asymmetric KEM results [%x] != [%x]", i, zzI, zzR)
 		}
+		log.Printf("Scheme %d: KEM results verification successful", i)
+
 	}
+
 }
 
 func TestDHSchemes(t *testing.T) {
